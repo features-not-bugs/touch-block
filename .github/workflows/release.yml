@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'release-v*.*.*'
+
+env:
+  GO_VERSION: '1.24'
+  APP_NAME: 'touch-block'
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true  # Stop all builds if one fails
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            output-name: linux-x64
+          - os: linux
+            arch: '386'
+            output-name: linux-x86
+          - os: linux
+            arch: arm64
+            output-name: linux-arm64
+          - os: linux
+            arch: arm
+            arm-version: '7'  # ARMv7 for 32-bit ARM
+            output-name: linux-arm32
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.arm-version }}
+        run: |
+          # Build the binary with optimizations
+          go build -v -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o ${{ env.APP_NAME }}-${{ matrix.output-name }} .
+          
+          # Make it executable
+          chmod +x ${{ env.APP_NAME }}-${{ matrix.output-name }}
+          
+          # Show file info for verification
+          ls -lh ${{ env.APP_NAME }}-${{ matrix.output-name }}
+          file ${{ env.APP_NAME }}-${{ matrix.output-name }}
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.output-name }}
+          path: ${{ env.APP_NAME }}-${{ matrix.output-name }}
+          retention-days: 1  # Short retention for release builds
+
+  release:
+    name: Create Release
+    needs: build  # Only run if all builds succeed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required for creating releases
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          
+          # Move all binaries to release-assets
+          for dir in artifacts/*; do
+            if [ -d "$dir" ]; then
+              mv "$dir"/* release-assets/
+            fi
+          done
+          
+          # Create checksums
+          cd release-assets
+          sha256sum * > checksums.txt
+          
+          # List all assets for verification
+          ls -la
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#release-}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          cat << EOF > release_notes.md
+          ## Release ${{ steps.version.outputs.version }}
+          
+          ### 📦 Available Binaries
+          
+          | Platform | Architecture | Binary |
+          |----------|-------------|--------|
+          | Linux | x64 (amd64) | \`${{ env.APP_NAME }}-linux-x64\` |
+          | Linux | x86 (386) | \`${{ env.APP_NAME }}-linux-x86\` |
+          | Linux | ARM64 | \`${{ env.APP_NAME }}-linux-arm64\` |
+          | Linux | ARM32 (ARMv7) | \`${{ env.APP_NAME }}-linux-arm32\` |
+          
+          ### 📝 Checksums
+          
+          SHA256 checksums are available in \`checksums.txt\`
+          
+          ### 💻 Usage
+          
+          Download the appropriate binary for your architecture and make it executable:
+          
+          \`\`\`bash
+          chmod +x ${{ env.APP_NAME }}-linux-*
+          ./${{ env.APP_NAME }}-linux-*
+          \`\`\`
+          
+          ### 🚀 What's Changed
+          
+          <!-- Auto-generated notes will be added below -->
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true  # Append auto-generated notes
+          files: |
+            release-assets/${{ env.APP_NAME }}-linux-x64
+            release-assets/${{ env.APP_NAME }}-linux-x86
+            release-assets/${{ env.APP_NAME }}-linux-arm64
+            release-assets/${{ env.APP_NAME }}-linux-arm32
+            release-assets/checksums.txt
+          fail_on_unmatched_files: true
+
+      - name: Cleanup artifacts
+        uses: geekyeggo/delete-artifact@v5
+        if: always()
+        with:
+          name: |
+            ${{ env.APP_NAME }}-linux-x64
+            ${{ env.APP_NAME }}-linux-x86
+            ${{ env.APP_NAME }}-linux-arm64
+            ${{ env.APP_NAME }}-linux-arm32
